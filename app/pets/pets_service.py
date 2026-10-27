@@ -2,35 +2,33 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
-from app.pets.pets_repository import PetsRepository, pets_repository
+from app.database.models import PetModel
+from app.pets.pets_repository import PetsRepository
 from app.pets.pets_schemas import CreatePetDto, Pet, PetList, UpdatePetDto
 from app.shared.datetimes import utc_now
 from app.shared.exceptions import conflict
-from app.students.students_service import StudentsService, students_service
 
 
 class PetsService:
-    def __init__(self, repository: PetsRepository, students: StudentsService) -> None:
+    def __init__(self, repository: PetsRepository) -> None:
         self.repository = repository
-        self.students_service = students
 
     def find_all_for_student(self, student_id: str) -> PetList:
-        self.students_service.find_by_id(student_id)
+        self.assert_student_exists(student_id)
 
-        pets = sorted(
-            self.repository.find_all_by_student(student_id),
-            key=lambda pet: pet.createdAt,
-            reverse=True,
+        pets = self.repository.find_all_by_student(student_id)
+
+        return PetList(
+            total=len(pets),
+            items=[Pet.model_validate(pet) for pet in pets],
         )
 
-        return PetList(total=len(pets), items=pets)
-
     def create(self, student_id: str, data: CreatePetDto) -> Pet:
-        self.students_service.find_by_id(student_id)
+        self.assert_student_exists(student_id)
         self.assert_no_conflicts(student_id, data)
 
         now = utc_now()
-        pet = Pet(
+        pet = PetModel(
             id=str(uuid4()),
             studentId=student_id,
             name=data.name,
@@ -40,32 +38,40 @@ class PetsService:
             updatedAt=now,
         )
 
-        return self.repository.save(pet)
+        saved = self.repository.save(pet)
 
-    def update(self, student_id: str, pet_id: str, data: UpdatePetDto) -> Pet:
+        return Pet.model_validate(saved)
+
+    def update(
+        self,
+        student_id: str,
+        pet_id: str,
+        data: UpdatePetDto,
+    ) -> Pet:
         existing = self.find_owned(student_id, pet_id)
         self.assert_no_conflicts(student_id, data, except_id=pet_id)
 
-        updated = existing.model_copy(
-            update={
-                **data.model_dump(exclude_none=True),
-                "updatedAt": utc_now(),
-            }
-        )
+        for field, value in data.model_dump(exclude_none=True).items():
+            setattr(existing, field, value)
 
-        return self.repository.save(updated)
+        existing.updatedAt = utc_now()
+        saved = self.repository.save(existing)
+
+        return Pet.model_validate(saved)
 
     def delete(self, student_id: str, pet_id: str) -> Pet:
         existing = self.find_owned(student_id, pet_id)
+        response = Pet.model_validate(existing)
+
         self.repository.delete(pet_id)
 
-        return existing
+        return response
 
     def delete_all_for_student(self, student_id: str) -> None:
         self.repository.delete_by_student(student_id)
 
-    def find_owned(self, student_id: str, pet_id: str) -> Pet:
-        self.students_service.find_by_id(student_id)
+    def find_owned(self, student_id: str, pet_id: str) -> PetModel:
+        self.assert_student_exists(student_id)
 
         pet = self.repository.find_by_id(pet_id)
 
@@ -77,21 +83,28 @@ class PetsService:
 
         return pet
 
+    def assert_student_exists(self, student_id: str) -> None:
+        if not self.repository.student_exists(student_id):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Estudiante no encontrado",
+            )
+
     def assert_no_conflicts(
         self,
         student_id: str,
         data: CreatePetDto | UpdatePetDto,
         except_id: str | None = None,
     ) -> None:
-        if not data.name:
+        if data.name is None:
             return
 
-        existing = self.repository.find_by_student_and_name(student_id, data.name)
+        existing = self.repository.find_by_student_and_name(
+            student_id,
+            data.name,
+        )
 
-        if existing and existing.id != except_id:
+        if existing is not None and existing.id != except_id:
             raise conflict(
                 {"name": {"message": "Ya tienes una mascota con ese nombre"}}
             )
-
-
-pets_service = PetsService(pets_repository, students_service)
