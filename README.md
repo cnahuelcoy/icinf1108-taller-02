@@ -456,6 +456,88 @@ uv run python -m app.database.check_connection
 - **pgAdmin no conecta al servidor**: revisa que el host sea `db` y el puerto `5432`, no `localhost`.
 - **pgAdmin no inicia y el log menciona el correo**: `PGADMIN_DEFAULT_EMAIL` debe ser un correo con formato válido (por ejemplo `admin@example.com`).
 
+## Pruebas de persistencia y transacciones
+
+Esta sección corresponde a la **Parte 2 del Taller Evaluado II**: aplicar las migraciones, preparar una base de pruebas aislada y demostrar con pruebas automatizadas que las operaciones entre Students y Pets se confirman completas o se deshacen completas.
+
+### Operaciones que modifican varias entidades
+
+| Operación                          | Entidades           | Cómo se protege                                                                 |
+| ---------------------------------- | ------------------- | ------------------------------------------------------------------------------- |
+| `POST /api/students` con `pets[]`  | `students` y `pets` | Una sola transacción (`session.begin()`) en `StudentsService.create`            |
+| `DELETE /api/students/{id}`        | `students` y `pets` | Una sola transacción en `StudentsService.delete` + `cascade="all, delete-orphan"` |
+| Borrado directo en SQL             | `students` y `pets` | Clave foránea `pets.student_id` con `ON DELETE CASCADE`                        |
+
+Reglas que siguen las capas:
+
+- El **controlador** abre una sesión por petición con `get_db` y se la entrega al servicio.
+- El **servicio** decide los límites de la transacción con `with session.begin():`. Si ocurre cualquier excepción dentro del bloque, SQLAlchemy hace **rollback** de todo; si termina sin errores, hace **commit**.
+- El **repositorio** usa la misma sesión y solo hace `flush()`, nunca `commit()`, para no cerrar la transacción a mitad de un caso de uso.
+
+### 1. Aplicar las migraciones
+
+Con los contenedores iniciados (`docker compose up -d`), desde la raíz del proyecto:
+
+```powershell
+uv sync
+uv run alembic upgrade head
+uv run alembic current        # debe mostrar la última revisión (head)
+docker compose exec db psql -U students_admin -d students_pets -c "\dt"
+```
+
+Alembic toma la conexión desde `DATABASE_URL` del archivo `.env`.
+
+### 2. Crear la base de pruebas aislada (una sola vez)
+
+Las pruebas crean y borran datos a propósito, por lo que **no se ejecutan sobre `students_pets`**, sino sobre `students_pets_test`, otra base dentro del mismo contenedor. No requiere cambios en Docker.
+
+```powershell
+docker compose exec db createdb -U students_admin students_pets_test
+
+# Aplicar las migraciones a la base de pruebas (solo en esta terminal)
+$env:DATABASE_URL = ((Get-Content .env | Select-String '^DATABASE_URL=').Line -replace '^DATABASE_URL=', '') -replace '/students_pets$', '/students_pets_test'
+uv run alembic upgrade head
+Remove-Item Env:DATABASE_URL
+
+docker compose exec db psql -U students_admin -d students_pets_test -c "\dt"
+```
+
+Si cambiaste `POSTGRES_USER`, reemplaza `students_admin` en los comandos. Cuando se agregue una migración nueva, repite el bloque de `$env:DATABASE_URL` para actualizar también la base de pruebas.
+
+### 3. Ejecutar las pruebas
+
+```powershell
+uv run pytest -v
+```
+
+- `tests/test_transactions_postgres.py` usa PostgreSQL. La URL se obtiene de `DATABASE_URL` agregando `_test` al nombre de la base; también se puede indicar con la variable `TEST_DATABASE_URL`.
+- Por seguridad, si el nombre de la base **no termina en `_test`**, las pruebas se detienen sin ejecutar nada.
+- Si PostgreSQL no está disponible, esas pruebas aparecen como `SKIPPED`: **no cuentan como aprobadas**. Inicia Docker y vuelve a ejecutarlas.
+- Cada prueba vacía `students` y `pets` de la base de pruebas antes de comenzar.
+- `tests/test_students_sqlalchemy.py` usa SQLite en memoria y no necesita Docker.
+
+Para ejecutar solo las pruebas de PostgreSQL:
+
+```powershell
+uv run pytest -m postgres -v
+```
+
+### Qué demuestran las pruebas
+
+| Prueba | Resultado esperado |
+| ------ | ------------------ |
+| `test_create_student_with_pets_commits_everything` | Transacción exitosa: el estudiante y sus 2 mascotas quedan guardados |
+| `test_rollback_when_pets_are_duplicated_in_request` | Error de negocio (409): no queda el estudiante ni sus mascotas |
+| `test_rollback_when_database_rejects_a_pet` | PostgreSQL rechaza una mascota (`ck_pets_age`) después de insertar el estudiante: rollback completo |
+| `test_rollback_when_second_pet_fails_after_first_was_flushed` | Error intencional a mitad de la transacción (id repetido): rollback completo |
+| `test_failed_request_does_not_affect_existing_data` | Un rollback no afecta datos confirmados antes |
+| `test_delete_student_removes_its_pets_and_keeps_others` | Se eliminan el estudiante y sus mascotas; las de otros estudiantes se mantienen |
+| `test_rollback_when_delete_fails_keeps_student_and_pets` | Error intencional después de eliminar: el estudiante y sus mascotas se restauran |
+| `test_database_rejects_pet_without_existing_student` | La clave foránea impide mascotas huérfanas |
+| `test_database_cascade_deletes_pets_outside_the_orm` | `ON DELETE CASCADE` elimina las mascotas aunque se borre directamente en SQL |
+
+Todas las comprobaciones se hacen desde una **sesión nueva**, distinta de la que ejecutó la operación, para verificar lo que realmente quedó guardado en PostgreSQL. Además, se cuenta que no existan mascotas cuyo `student_id` no corresponda a un estudiante.
+
 ## Comandos útiles
 
 - `make install` — sincroniza dependencias con uv
